@@ -24,8 +24,6 @@ const (
 )
 
 func main() {
-	// Re-execution check: if the first argument is "init", we are running
-	// inside the container's PID/mount/network namespaces.
 	if len(os.Args) > 1 && os.Args[1] == "init" {
 		if len(os.Args) < 4 {
 			fmt.Fprintln(os.Stderr, "[-] Invalid init arguments.")
@@ -45,7 +43,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Ensure bridge br0 exists on the host.
 	if err := ensureBridgeExists(); err != nil {
 		fmt.Printf("[-] Failed to configure bridge %s: %v\n", BridgeName, err)
 		os.Exit(1)
@@ -55,10 +52,10 @@ func main() {
 	fmt.Printf("[+] Generated Client ID: %s\n", clientID)
 
 	clientDir := filepath.Join(BaseStorageDir, clientID)
-	lowerDir := filepath.Join(clientDir, "lower")   // extracted base rootfs
-	upperDir := filepath.Join(clientDir, "upper")   // writable layer
-	workDir := filepath.Join(clientDir, "work")     // OverlayFS workdir
-	mergedDir := filepath.Join(clientDir, "merged") // final rootfs view
+	lowerDir := filepath.Join(clientDir, "lower")
+	upperDir := filepath.Join(clientDir, "upper")
+	workDir := filepath.Join(clientDir, "work")
+	mergedDir := filepath.Join(clientDir, "merged")
 
 	for _, dir := range []string{lowerDir, upperDir, workDir, mergedDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -70,14 +67,11 @@ func main() {
 	sourceRoot := sourceRootDir()
 	osPath := filepath.Join(sourceRoot, "os_images", "alpine-minirootfs-3.24.0-x86_64.tar.gz")
 
-	// The directories are created before extraction, so checking only whether
-	// lowerDir exists would incorrectly skip extraction. Use a marker instead.[cite: 2]
 	if err := extractOS(lowerDir, osPath); err != nil {
 		fmt.Printf("[-] Error extracting OS '%v': %v\n", filepath.Base(osPath), err)
 		os.Exit(1)
 	}
 
-	// OverlayFS requires upperdir and workdir to be on the same filesystem.[cite: 2]
 	overlayOpts := fmt.Sprintf(
 		"lowerdir=%s,upperdir=%s,workdir=%s",
 		lowerDir, upperDir, workDir,
@@ -93,39 +87,15 @@ func main() {
 		}
 	}()
 
-	etcDir := filepath.Join(mergedDir, "etc")
-	if err := os.MkdirAll(etcDir, 0755); err != nil {
-		fmt.Printf("[-] Error creating container /etc directory: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Alpine may ship resolv.conf as a symlink. Remove it before replacing it
-	// with a regular file.[cite: 2]
-	resolvPath := filepath.Join(etcDir, "resolv.conf")
-	if err := os.Remove(resolvPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		fmt.Printf("[-] Error preparing resolv.conf: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := copyFile("/etc/resolv.conf", resolvPath); err != nil {
-		fmt.Printf("[-] Error copying resolv.conf into container: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Setup a cgroup if cgroup v2 is available.[cite: 2]
 	cgroupDir := filepath.Join("/sys/fs/cgroup", "vps-"+clientID)
 	if err := setupCgroup(cgroupDir); err != nil {
 		fmt.Printf("[-] Warning: cgroup setup failed: %v\n", err)
 	}
 
-	// Linux interface names are limited to 15 characters. Also, do not use
-	// "eth0" as the peer while it is still in the host namespace.
-	// Use short generated names that cannot collide with a normal host eth0.
 	nameSeed := uint32(time.Now().UnixNano()) ^ uint32(os.Getpid())
 	vethHost := fmt.Sprintf("vh%08x", nameSeed)
 	vethContainer := fmt.Sprintf("vc%08x", nameSeed)
 
-	// Start child first so its PID identifies the new network namespace.
 	cmd := exec.Command("/proc/self/exe", "init", mergedDir, vethContainer)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -153,8 +123,6 @@ func main() {
 
 	defer runCmd("ip", "link", "del", vethHost)
 
-	// Move the peer first. Once moved, it is no longer visible in the host
-	// namespace and is owned by the child's network namespace.
 	if err := moveVethToNamespace(vethContainer, containerPID, 30*time.Second); err != nil {
 		fmt.Printf("[-] Failed to move %s into container namespace: %v\n", vethContainer, err)
 		_ = cmd.Process.Kill()
@@ -162,11 +130,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Keep the generated interface name inside the container namespace.
-	// Renaming here would race with the child, which is already waiting for
-	// vethContainer. The generated name is valid on Linux (<= 15 chars).
-
-	// Configure the host endpoint after the peer has been handed off.
 	if err := runCmd("ip", "link", "set", vethHost, "master", BridgeName); err != nil {
 		fmt.Printf("[-] Failed to attach %s to %s: %v\n", vethHost, BridgeName, err)
 		_ = cmd.Process.Kill()
@@ -181,7 +144,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Move container process into the cgroup tree.[cite: 2]
 	if err := addToCgroup(cgroupDir, containerPID); err != nil {
 		fmt.Printf("[-] Warning: failed to add process to cgroup: %v\n", err)
 	}
@@ -203,9 +165,6 @@ func runContainer(mergedDir string, vethName string) {
 		os.Exit(1)
 	}
 
-	// The parent process creates the veth and moves it into this namespace.
-	// Keep PID 1 alive long enough for that hand-off to complete. Do NOT
-	// configure networking until the peer has actually arrived.
 	if err := waitForInterface(vethName, 60*time.Second); err != nil {
 		fmt.Printf("[-] Error waiting for network interface %s: %v\n", vethName, err)
 		os.Exit(1)
@@ -235,6 +194,10 @@ func runContainer(mergedDir string, vethName string) {
 		fmt.Printf("[-] Warning: failed to mount procfs: %v\n", err)
 	} else {
 		defer syscall.Unmount("/proc", 0)
+	}
+
+	if err := os.MkdirAll("/etc", 0755); err == nil {
+		_ = os.WriteFile("/etc/resolv.conf", []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644)
 	}
 
 	fmt.Println("[+] Container started. Type 'exit' to stop.")
@@ -308,7 +271,6 @@ func moveVethToNamespace(name string, pid int, timeout time.Duration) error {
 
 func ensureBridgeExists() error {
 	if err := exec.Command("ip", "link", "show", BridgeName).Run(); err == nil {
-		// Make sure an existing bridge has the expected address and is up.[cite: 2]
 		_ = runCmd("ip", "addr", "add", "10.100.0.1/24", "dev", BridgeName)
 		_ = runCmd("ip", "link", "set", BridgeName, "up")
 		_ = runCmd("sysctl", "-w", "net.ipv4.ip_forward=1")
@@ -335,11 +297,32 @@ func ensureBridgeExists() error {
 		return err
 	}
 
+	if hostInterface, err := getHostsDefaultInterface(); err == nil && hostInterface != "" {
+		fmt.Printf("[+] Setting up NAT masquerade on interface: %s\n", hostInterface)
+		_ = runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "10.100.0.0/24", "!", "-o", BridgeName, "-j", "MASQUERADE")
+		_ = runCmd("iptables", "-A", "FORWARD", "-i", BridgeName, "-o", hostInterface, "-j", "ACCEPT")
+		_ = runCmd("iptables", "-A", "FORWARD", "-i", hostInterface, "-o", BridgeName, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+	}
+
 	return nil
 }
 
+func getHostsDefaultInterface() (string, error) {
+	cmd := exec.Command("ip", "route", "show", "default")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	parts := strings.Fields(string(output))
+	for i, p := range parts {
+		if p == "dev" && i+1 < len(parts) {
+			return parts[i+1], nil
+		}
+	}
+	return "", fmt.Errorf("default interface not found")
+}
+
 func createVethPair(hostName, containerName string) error {
-	// Both names are generated by this program, so cleaning them is safe.
 	_ = runCmd("ip", "link", "del", hostName)
 	_ = runCmd("ip", "link", "del", containerName)
 
@@ -356,7 +339,6 @@ func setupCgroup(cgroupDir string) error {
 		return err
 	}
 
-	// cgroup v2 memory limit: 100 MiB.[cite: 2]
 	if err := os.WriteFile(
 		filepath.Join(cgroupDir, "memory.max"),
 		[]byte("104857600"),
@@ -377,7 +359,6 @@ func addToCgroup(cgroupDir string, pid int) error {
 	)
 }
 
-// Extract OS from tar.gz if it has not already been extracted.[cite: 2]
 func extractOS(lowerDir, osPath string) error {
 	if _, err := os.Stat(osPath); err != nil {
 		return fmt.Errorf("OS image not found: %w", err)
@@ -457,7 +438,7 @@ func extractTarGz(tarball, targetDir string) error {
 
 		name := filepath.Clean(header.Name)
 		if name == "." || name == "" {
-			continue // Safely skip root pointer headers from the tarball
+			continue
 		}
 		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(os.PathSeparator)) {
 			return fmt.Errorf("unsafe path in tar archive: %q", header.Name)
@@ -519,25 +500,4 @@ func extractTarGz(tarball, targetDir string) error {
 	}
 
 	return nil
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-		return err
-	}
-
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, in)
-	return err
 }
