@@ -3,12 +3,13 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
-	"math/rand"
+	mathrand "math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 const (
 	BaseStorageDir = "/var/lib/funnybunny"
 	BridgeName     = "br0"
+	ContainerIP    = "10.100.0.50"
 )
 
 func main() {
@@ -48,8 +50,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	clientID := generateClientID()
-	fmt.Printf("[+] Generated Client ID: %s\n", clientID)
+	var clientID string
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		clientID = os.Args[1]
+	} else {
+		clientID = generateClientID()
+	}
+	fmt.Printf("[+] Using Client ID: %s\n", clientID)
 
 	clientDir := filepath.Join(BaseStorageDir, clientID)
 	lowerDir := filepath.Join(clientDir, "lower")
@@ -72,10 +79,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	overlayOpts := fmt.Sprintf(
-		"lowerdir=%s,upperdir=%s,workdir=%s",
-		lowerDir, upperDir, workDir,
-	)
+	overlayOpts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerDir, upperDir, workDir)
 	if err := syscall.Mount("overlay", mergedDir, "overlay", 0, overlayOpts); err != nil {
 		fmt.Printf("[-] Failed to mount OverlayFS: %v\n", err)
 		os.Exit(1)
@@ -87,7 +91,25 @@ func main() {
 		}
 	}()
 
-	cgroupDir := filepath.Join("/sys/fs/cgroup", "vps-"+clientID)
+	sshPassFile := filepath.Join(clientDir, ".ssh_passwd")
+	var sshPassword string
+	if data, err := os.ReadFile(sshPassFile); err == nil {
+		sshPassword = strings.TrimSpace(string(data))
+	} else {
+		sshPassword = generateRandomPassword(10)
+		_ = os.WriteFile(sshPassFile, []byte(sshPassword+"\n"), 0600)
+		configureSSHUser(mergedDir, clientID, sshPassword)
+	}
+
+	fmt.Println("\n========================================")
+	fmt.Printf("[+] SSH Access Enabled for Container!\n")
+	fmt.Printf("[+] IP Address: %s\n", ContainerIP)
+	fmt.Printf("[+] Username:   %s\n", clientID)
+	fmt.Printf("[+] Password:   %s\n", sshPassword)
+	fmt.Printf("[+] Command:    ssh %s@%s\n", clientID, ContainerIP)
+	fmt.Printf("========================================\n\n")
+
+	cgroupDir := filepath.Join("/sys/fs/cgroup", clientID)
 	if err := setupCgroup(cgroupDir); err != nil {
 		fmt.Printf("[-] Warning: cgroup setup failed: %v\n", err)
 	}
@@ -152,15 +174,37 @@ func main() {
 		fmt.Printf("[-] Container exited with error: %v\n", err)
 	}
 
-	fmt.Printf("[+] VPS session %s ended. Cleaning up...\n", clientID)
+	fmt.Printf("[+] VPS session %s ended. State preserved in %s\n", clientID, upperDir)
 
 	if err := os.RemoveAll(cgroupDir); err != nil {
 		fmt.Printf("[-] Warning: failed to remove cgroup %s: %v\n", cgroupDir, err)
 	}
 }
 
+func configureSSHUser(mergedDir, username, password string) {
+	_ = os.MkdirAll(filepath.Join(mergedDir, "etc", "ssh"), 0755)
+	_ = os.MkdirAll(filepath.Join(mergedDir, "var", "empty"), 0755)
+
+	_ = os.WriteFile(filepath.Join(mergedDir, "etc", "resolv.conf"), []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644)
+
+	sshdConfig := "ListenAddress 10.100.0.50\nPermitRootLogin yes\nPasswordAuthentication yes\nPermitEmptyPasswords no\n"
+	_ = os.WriteFile(filepath.Join(mergedDir, "etc", "ssh", "sshd_config"), []byte(sshdConfig), 0644)
+
+	addCmd := fmt.Sprintf("apk update && apk add openssh shadow && adduser -D -s /bin/sh %s", username)
+	chrootCmd := exec.Command("chroot", mergedDir, "/bin/sh", "-c", addCmd)
+	if out, err := chrootCmd.CombinedOutput(); err != nil {
+		fmt.Printf("[-] SSH installation failed: %v\n%s\n", err, out)
+	}
+
+	passCmd := fmt.Sprintf("echo '%s:%s' | chpasswd && echo 'root:%s' | chpasswd", username, password, password)
+	chrootPassCmd := exec.Command("chroot", mergedDir, "/bin/sh", "-c", passCmd)
+	if out, err := chrootPassCmd.CombinedOutput(); err != nil {
+		fmt.Printf("[-] Password setup failed: %v\n%s\n", err, out)
+	}
+}
+
 func runContainer(mergedDir string, vethName string) {
-	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
+	if err := syscall.Mount("/", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
 		fmt.Printf("[-] Error: failed to make mount tree private: %v\n", err)
 		os.Exit(1)
 	}
@@ -185,22 +229,36 @@ func runContainer(mergedDir string, vethName string) {
 		os.Exit(1)
 	}
 
-	if err := os.MkdirAll("/proc", 0555); err != nil {
-		fmt.Printf("[-] Error creating /proc: %v\n", err)
-		os.Exit(1)
+	if err := os.MkdirAll("/proc", 0555); err == nil {
+		_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	}
 
-	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		fmt.Printf("[-] Warning: failed to mount procfs: %v\n", err)
-	} else {
-		defer syscall.Unmount("/proc", 0)
+	if err := os.MkdirAll("/dev", 0755); err == nil {
+		_ = syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, "")
+	}
+
+	if err := os.MkdirAll("/dev/pts", 0755); err == nil {
+		_ = syscall.Mount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=0666")
+		_ = os.Remove("/dev/ptmx")
+		_ = os.Symlink("/dev/pts/ptmx", "/dev/ptmx")
 	}
 
 	if err := os.MkdirAll("/etc", 0755); err == nil {
 		_ = os.WriteFile("/etc/resolv.conf", []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644)
 	}
 
-	fmt.Println("[+] Container started. Type 'exit' to stop.")
+	_ = exec.Command("ssh-keygen", "-A").Run()
+
+	sshCmd := exec.Command("/usr/sbin/sshd", "-D", "-e")
+	sshCmd.Stderr = os.Stderr
+	sshCmd.Stdout = os.Stdout
+	go func() {
+		if err := sshCmd.Run(); err != nil {
+			fmt.Printf("[-] SSH Daemon exited: %v\n", err)
+		}
+	}()
+
+	fmt.Println("[+] Container started with SSH service running. Type 'exit' to stop.")
 
 	shell := exec.Command("/bin/sh")
 	shell.Stdin = os.Stdin
@@ -216,25 +274,20 @@ func setupContainerNetwork(vethName string) error {
 	if err := waitForInterface(vethName, 15*time.Second); err != nil {
 		return err
 	}
-
-	if err := runCmd("ip", "addr", "add", "10.100.0.50/24", "dev", vethName); err != nil {
+	if err := runCmd("ip", "addr", "add", ContainerIP+"/24", "dev", vethName); err != nil {
 		if !strings.Contains(err.Error(), "File exists") {
 			return err
 		}
 	}
-
 	if err := runCmd("ip", "link", "set", vethName, "up"); err != nil {
 		return err
 	}
-
 	if err := runCmd("ip", "link", "set", "lo", "up"); err != nil {
 		return err
 	}
-
 	if err := runCmd("ip", "route", "replace", "default", "via", "10.100.0.1"); err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -244,8 +297,7 @@ func waitForInterface(name string, timeout time.Duration) error {
 		if _, err := os.Stat(filepath.Join("/sys/class/net", name)); err == nil {
 			return nil
 		}
-		if data, err := os.ReadFile("/proc/net/dev"); err == nil &&
-			strings.Contains(string(data), name+":") {
+		if data, err := os.ReadFile("/proc/net/dev"); err == nil && strings.Contains(string(data), name+":") {
 			return nil
 		}
 		time.Sleep(25 * time.Millisecond)
@@ -297,7 +349,7 @@ func ensureBridgeExists() error {
 		return err
 	}
 
-	if hostInterface, err := getHostsDefaultInterface(); err == nil && hostInterface != "" {
+	if hostInterface, err := getDefaultRouteInterface(); err == nil && hostInterface != "" {
 		fmt.Printf("[+] Setting up NAT masquerade on interface: %s\n", hostInterface)
 		_ = runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "10.100.0.0/24", "!", "-o", BridgeName, "-j", "MASQUERADE")
 		_ = runCmd("iptables", "-A", "FORWARD", "-i", BridgeName, "-o", hostInterface, "-j", "ACCEPT")
@@ -307,7 +359,7 @@ func ensureBridgeExists() error {
 	return nil
 }
 
-func getHostsDefaultInterface() (string, error) {
+func getDefaultRouteInterface() (string, error) {
 	cmd := exec.Command("ip", "route", "show", "default")
 	output, err := cmd.Output()
 	if err != nil {
@@ -325,38 +377,22 @@ func getHostsDefaultInterface() (string, error) {
 func createVethPair(hostName, containerName string) error {
 	_ = runCmd("ip", "link", "del", hostName)
 	_ = runCmd("ip", "link", "del", containerName)
-
-	return runCmd(
-		"ip", "link", "add",
-		hostName,
-		"type", "veth",
-		"peer", "name", containerName,
-	)
+	return runCmd("ip", "link", "add", hostName, "type", "veth", "peer", "name", containerName)
 }
 
 func setupCgroup(cgroupDir string) error {
 	if err := os.MkdirAll(cgroupDir, 0755); err != nil {
 		return err
 	}
-
-	if err := os.WriteFile(
-		filepath.Join(cgroupDir, "memory.max"),
-		[]byte("104857600"),
-		0644,
-	); err != nil {
+	if err := os.WriteFile(filepath.Join(cgroupDir, "memory.max"), []byte("104857600"), 0644); err != nil {
 		_ = os.Remove(cgroupDir)
 		return err
 	}
-
 	return nil
 }
 
 func addToCgroup(cgroupDir string, pid int) error {
-	return os.WriteFile(
-		filepath.Join(cgroupDir, "cgroup.procs"),
-		fmt.Appendf(nil, "%d", pid),
-		0644,
-	)
+	return os.WriteFile(filepath.Join(cgroupDir, "cgroup.procs"), fmt.Appendf(nil, "%d", pid), 0644)
 }
 
 func extractOS(lowerDir, osPath string) error {
@@ -376,11 +412,9 @@ func extractOS(lowerDir, osPath string) error {
 	if err := os.MkdirAll(lowerDir, 0755); err != nil {
 		return err
 	}
-
 	if err := extractTarGz(osPath, lowerDir); err != nil {
 		return fmt.Errorf("error extracting rootfs: %w", err)
 	}
-
 	if err := os.WriteFile(marker, []byte("ready\n"), 0644); err != nil {
 		return fmt.Errorf("failed to write rootfs marker: %w", err)
 	}
@@ -389,7 +423,17 @@ func extractOS(lowerDir, osPath string) error {
 }
 
 func generateClientID() string {
-	return fmt.Sprintf("vps-%04d", rand.Intn(10000))
+	return fmt.Sprintf("srv%d-funnybunny", 100000+mathrand.Intn(900000))
+}
+
+func generateRandomPassword(length int) string {
+	bytes := make([]byte, length)
+	_, _ = cryptorand.Read(bytes)
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	for i, b := range bytes {
+		bytes[i] = letters[b%byte(len(letters))]
+	}
+	return string(bytes)
 }
 
 func sourceRootDir() string {
@@ -397,7 +441,6 @@ func sourceRootDir() string {
 	if !ok {
 		log.Fatalln("No caller data available")
 	}
-
 	return filepath.Dir(filename)
 }
 
@@ -451,31 +494,22 @@ func extractTarGz(tarball, targetDir string) error {
 			if err := os.MkdirAll(target, os.FileMode(header.Mode)|0700); err != nil {
 				return err
 			}
-
 		case tar.TypeReg, tar.TypeRegA:
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
 			}
-
-			outFile, err := os.OpenFile(
-				target,
-				os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
-				os.FileMode(header.Mode),
-			)
+			outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
 			if err != nil {
 				return err
 			}
-
 			_, copyErr := io.Copy(outFile, tarReader)
 			closeErr := outFile.Close()
-
 			if copyErr != nil {
 				return copyErr
 			}
 			if closeErr != nil {
 				return closeErr
 			}
-
 		case tar.TypeSymlink:
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
@@ -484,7 +518,6 @@ func extractTarGz(tarball, targetDir string) error {
 			if err := os.Symlink(header.Linkname, target); err != nil {
 				return err
 			}
-
 		case tar.TypeLink:
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
@@ -493,11 +526,9 @@ func extractTarGz(tarball, targetDir string) error {
 			if err := os.Link(linkTarget, target); err != nil {
 				return err
 			}
-
 		default:
 			continue
 		}
 	}
-
 	return nil
 }
