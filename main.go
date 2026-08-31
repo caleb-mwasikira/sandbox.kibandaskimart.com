@@ -1,36 +1,34 @@
 package main
 
 import (
-	"archive/tar"
-	"compress/gzip"
-	cryptorand "crypto/rand"
-	"database/sql"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/fs"
-	"log"
-	mathrand "math/rand"
+	"sync"
+
+	"database/sql"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 const (
-	BaseStorageDir = "/var/lib/funnybunny"
+	BaseStorageDir = "/var/lib/cappybarahosting"
 	BridgeName     = "br0"
 	ContainerIP    = "10.100.0.50"
-	DBFileName     = "funnybunny.db"
+	DBFileName     = "cappybarahosting.db"
 )
 
+var db *sql.DB
+
 func main() {
+	db = initDB()
+	defer db.Close()
+
 	osFlag := flag.String("os", "alpine", "OS image name to use (e.g. alpine, ubuntu)")
 	flag.Parse()
 
@@ -40,7 +38,7 @@ func main() {
 			fmt.Printf("[-] Usage: go run main.go %s <name> <path/to/file>\n", args[0])
 			os.Exit(1)
 		}
-		registerOSImage(args[1], args[2])
+		addOSImage(args[1], args[2])
 		return
 	}
 
@@ -72,9 +70,6 @@ func main() {
 		fmt.Printf("[-] Failed to create storage directory: %v\n", err)
 		os.Exit(1)
 	}
-
-	db := initDB()
-	defer db.Close()
 
 	osRecord, err := getOSImage(db, *osFlag)
 	if err != nil {
@@ -113,20 +108,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	defer func() {
-		_ = syscall.Unmount(lowerDir, 0)
-	}()
-
 	overlayOpts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerDir, upperDir, workDir)
 	if err := syscall.Mount("overlay", mergedDir, "overlay", 0, overlayOpts); err != nil {
 		fmt.Printf("[-] Failed to mount OverlayFS: %v\n", err)
 		os.Exit(1)
 	}
 
-	defer func() {
-		if err := syscall.Unmount(mergedDir, 0); err != nil {
-			fmt.Printf("[-] Warning: failed to unmount rootfs: %v\n", err)
-		}
+	cgroupDir := filepath.Join("/sys/fs/cgroup", clientID)
+	nameSeed := uint32(time.Now().UnixNano()) ^ uint32(os.Getpid())
+	vethHost := fmt.Sprintf("vh%08x", nameSeed)
+	vethContainer := fmt.Sprintf("vc%08x", nameSeed)
+
+	// Call teardown when main function finishes normally
+	defer teardown(mergedDir, lowerDir, cgroupDir, vethHost)
+
+	// Graceful shutdown when program receives SIGTERM signal from OS
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		teardown(mergedDir, lowerDir, cgroupDir, vethHost)
+		os.Exit(0)
 	}()
 
 	sshPassFile := filepath.Join(clientDir, ".ssh_passwd")
@@ -147,15 +149,11 @@ func main() {
 	fmt.Printf("[+] Command:    ssh %s@%s\n", clientID, ContainerIP)
 	fmt.Println("========================================\n")
 
-	cgroupDir := filepath.Join("/sys/fs/cgroup", clientID)
 	if err := setupCgroup(cgroupDir); err != nil {
 		fmt.Printf("[-] Warning: cgroup setup failed: %v\n", err)
 	}
 
-	nameSeed := uint32(time.Now().UnixNano()) ^ uint32(os.Getpid())
-	vethHost := fmt.Sprintf("vh%08x", nameSeed)
-	vethContainer := fmt.Sprintf("vc%08x", nameSeed)
-
+	// Start container
 	cmd := exec.Command("/proc/self/exe", "init", mergedDir, vethContainer)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -180,8 +178,6 @@ func main() {
 		_ = cmd.Wait()
 		os.Exit(1)
 	}
-
-	defer runCmd("ip", "link", "del", vethHost)
 
 	if err := moveVethToNamespace(vethContainer, containerPID, 30*time.Second); err != nil {
 		fmt.Printf("[-] Failed to move %s into container namespace: %v\n", vethContainer, err)
@@ -213,115 +209,6 @@ func main() {
 	}
 
 	fmt.Printf("[+] VPS session %s ended. State preserved in %s\n", clientID, upperDir)
-
-	if err := os.RemoveAll(cgroupDir); err != nil {
-		fmt.Printf("[-] Warning: failed to remove cgroup %s: %v\n", cgroupDir, err)
-	}
-}
-
-type OSImageRecord struct {
-	Name string
-	Path string
-}
-
-func initDB() *sql.DB {
-	dbPath := filepath.Join(BaseStorageDir, DBFileName)
-	_ = os.MkdirAll(BaseStorageDir, 0755)
-
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		log.Fatalf("[-] Failed to open sqlite database: %v", err)
-	}
-
-	query := `CREATE TABLE IF NOT EXISTS os_images (
-		name TEXT PRIMARY KEY,
-		path TEXT NOT NULL
-	);`
-	if _, err := db.Exec(query); err != nil {
-		log.Fatalf("[-] Failed to create table: %v", err)
-	}
-
-	return db
-}
-
-func registerOSImage(name, imagePath string) {
-	absPath, err := filepath.Abs(imagePath)
-	if err != nil {
-		log.Fatalf("[-] Invalid path: %v", err)
-	}
-
-	db := initDB()
-	defer db.Close()
-
-	_, err = db.Exec("INSERT OR REPLACE INTO os_images (name, path) VALUES (?, ?)", name, absPath)
-	if err != nil {
-		log.Fatalf("[-] Failed to add OS/ISO image in database: %v", err)
-	}
-
-	fmt.Printf("[+] Successfully registered image '%s' -> %s\n", name, absPath)
-}
-
-func deleteOSImage(name string) {
-	db := initDB()
-	defer db.Close()
-
-	result, err := db.Exec("DELETE FROM os_images WHERE name = ?", name)
-	if err != nil {
-		log.Fatalf("[-] Failed to delete OS image from database: %v", err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		log.Fatalf("[-] Failed to check deletion result: %v", err)
-	}
-
-	if rowsAffected == 0 {
-		fmt.Printf("[-] OS image '%s' not found in database.\n", name)
-		return
-	}
-
-	fmt.Printf("[+] Successfully deleted OS image '%s' from database.\n", name)
-}
-
-func listOSImages() {
-	db := initDB()
-	defer db.Close()
-
-	rows, err := db.Query("SELECT name, path FROM os_images")
-	if err != nil {
-		log.Fatalf("[-] Failed to query database: %v", err)
-	}
-	defer rows.Close()
-
-	fmt.Println("Available OS/ISO Images:")
-	fmt.Println("----------------------------------------")
-	found := false
-	for rows.Next() {
-		var name, path string
-		if err := rows.Scan(&name, &path); err != nil {
-			continue
-		}
-		fmt.Printf("Name: %s\nPath: %s\n\n", name, path)
-		found = true
-	}
-
-	if err := rows.Err(); err != nil {
-		log.Printf("[-] Error during rows iteration: %v", err)
-	}
-
-	if !found {
-		fmt.Println("No OS images registered yet.")
-	}
-}
-
-func getOSImage(db *sql.DB, name string) (OSImageRecord, error) {
-	var record OSImageRecord
-	row := db.QueryRow("SELECT name, path FROM os_images WHERE name = ?", name)
-	err := row.Scan(&record.Name, &record.Path)
-	if err != nil {
-		return record, err
-	}
-	return record, nil
 }
 
 func configureSSHUser(mergedDir, username, password string) {
@@ -423,12 +310,10 @@ func runContainer(mergedDir string, vethName string) {
 		_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	}
 
-	// Mount an isolated tmpfs for container /dev to protect host /dev
 	if err := os.MkdirAll("/dev", 0755); err == nil {
 		_ = syscall.Mount("tmpfs", "/dev", "tmpfs", syscall.MS_NOSUID|syscall.MS_STRICTATIME, "mode=0755")
 	}
 
-	// Helper to safely create essential isolated device nodes
 	createDev := func(path string, mode uint32, major, minor int) {
 		dev := (major << 8) | minor
 		_ = syscall.Mknod(path, mode|syscall.S_IFCHR, dev)
@@ -442,7 +327,6 @@ func runContainer(mergedDir string, vethName string) {
 	createDev("/dev/urandom", 0666, 1, 9)
 	createDev("/dev/tty", 0666, 5, 0)
 
-	// Mount private isolated devpts instance
 	if err := os.MkdirAll("/dev/pts", 0755); err == nil {
 		_ = syscall.Mount("devpts", "/dev/pts", "devpts", syscall.MS_NOSUID|syscall.MS_NOEXEC, "newinstance,ptmxmode=0666,mode=0620")
 		_ = os.Symlink("pts/ptmx", "/dev/ptmx")
@@ -487,6 +371,8 @@ func runContainer(mergedDir string, vethName string) {
 	}
 
 	_ = os.MkdirAll("/var/empty", 0755)
+	_ = os.MkdirAll("/run/sshd", 0755) // Ensure the required privilege separation runtime directory exists
+
 	_ = exec.Command("/bin/sh", "-c", "id -u sshd >/dev/null 2>&1 || (groupadd -r sshd 2>/dev/null || addgroup -g 74 sshd 2>/dev/null; useradd -M -r -g sshd -c 'Privilege-separated SSH' -d /var/empty -s /sbin/nologin sshd 2>/dev/null || adduser -D -H -h /var/empty -s /sbin/nologin -G sshd sshd 2>/dev/null)").Run()
 
 	_ = exec.Command("ssh-keygen", "-A").Run()
@@ -655,7 +541,10 @@ func extractOS(lowerDir, imagePath string) error {
 		return err
 	}
 
-	if strings.HasSuffix(strings.ToLower(imagePath), ".iso") {
+	imageIsISO := strings.HasSuffix(strings.ToLower(imagePath), ".iso")
+	imageIsSquashFS := strings.HasSuffix(strings.ToLower(imagePath), ".squashfs")
+
+	if imageIsISO {
 		fmt.Printf("[+] Mounting and inspecting ISO '%v'...\n", filepath.Base(imagePath))
 
 		tempMountDir, err := os.MkdirTemp("", "iso-mount-*")
@@ -696,7 +585,7 @@ func extractOS(lowerDir, imagePath string) error {
 				return fmt.Errorf("failed to copy ISO contents: %w", err)
 			}
 		}
-	} else if strings.HasSuffix(strings.ToLower(imagePath), ".squashfs") {
+	} else if imageIsSquashFS {
 		fmt.Printf("[+] Found SquashFS payload at '%s'. Mounting directly...\n", filepath.Base(imagePath))
 		if err := syscall.Mount(imagePath, lowerDir, "squashfs", syscall.MS_RDONLY, "loop"); err != nil {
 			if err := runCmd("mount", "-o", "loop,ro", imagePath, lowerDir); err != nil {
@@ -713,179 +602,34 @@ func extractOS(lowerDir, imagePath string) error {
 	return nil
 }
 
-func copyDirContents(src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return nil
-		}
-		targetPath := filepath.Join(dst, rel)
-		if d.IsDir() {
-			return os.MkdirAll(targetPath, 0755)
-		}
+// Ensures teardown func is only run once
+var cleanup sync.Once
 
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
+// teardown safely unmounts filesystems, cleans up network interfaces, and removes cgroups
+func teardown(mergedDir, lowerDir, cgroupDir, vethHost string) {
+	cleanup.Do(func() {
+		fmt.Println("\n[+] Running cleanup and teardown...")
 
-		if info.Mode()&os.ModeSymlink != 0 {
-			linkDest, err := os.Readlink(path)
-			if err != nil {
-				return err
+		if mergedDir != "" {
+			if err := syscall.Unmount(mergedDir, 0); err != nil {
+				_ = runCmd("umount", "-lf", mergedDir)
 			}
-			_ = os.Remove(targetPath)
-			return os.Symlink(linkDest, targetPath)
 		}
 
-		return copyFile(path, targetPath, info.Mode())
+		if lowerDir != "" {
+			if err := syscall.Unmount(lowerDir, 0); err != nil {
+				_ = runCmd("umount", "-lf", lowerDir)
+			}
+		}
+
+		if vethHost != "" {
+			_ = runCmd("ip", "link", "del", vethHost)
+		}
+
+		if cgroupDir != "" {
+			_ = os.RemoveAll(cgroupDir)
+		}
+
+		fmt.Println("[+] Cleanup complete.")
 	})
-}
-
-func copyFile(src, dst string, mode fs.FileMode) error {
-	srcFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer srcFile.Close()
-
-	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-	if err != nil {
-		return err
-	}
-	defer dstFile.Close()
-
-	buf := make([]byte, 32*1024)
-	for {
-		n, readErr := srcFile.Read(buf)
-		if n > 0 {
-			if _, writeErr := dstFile.Write(buf[:n]); writeErr != nil {
-				return writeErr
-			}
-		}
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				break
-			}
-			return readErr
-		}
-	}
-	return nil
-}
-
-func generateClientID() string {
-	return fmt.Sprintf("srv%d-funnybunny-cloud", 100000+mathrand.Intn(900000))
-}
-
-func generateRandomPassword(length int) string {
-	bytes := make([]byte, length)
-	_, _ = cryptorand.Read(bytes)
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	for i, b := range bytes {
-		bytes[i] = letters[b%byte(len(letters))]
-	}
-	return string(bytes)
-}
-
-func sourceRootDir() string {
-	_, filename, _, ok := runtime.Caller(0)
-	if !ok {
-		log.Fatalln("No caller data available")
-	}
-	return filepath.Dir(filename)
-}
-
-func runCmd(name string, arg ...string) error {
-	cmd := exec.Command(name, arg...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		if len(output) > 0 {
-			return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
-		}
-		return err
-	}
-	return nil
-}
-
-func extractTarGz(tarball, targetDir string) error {
-	file, err := os.Open(tarball)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	gzReader, err := gzip.NewReader(file)
-	if err != nil {
-		return err
-	}
-	defer gzReader.Close()
-
-	tarReader := tar.NewReader(gzReader)
-
-	for {
-		header, err := tarReader.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return err
-		}
-
-		name := filepath.Clean(header.Name)
-		if name == "." || name == "" {
-			continue
-		}
-		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(os.PathSeparator)) {
-			return fmt.Errorf("unsafe path in tar archive: %q", header.Name)
-		}
-
-		target := filepath.Join(targetDir, name)
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(header.Mode)|0700); err != nil {
-				return err
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-				return err
-			}
-			outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.Copy(outFile, tarReader)
-			closeErr := outFile.Close()
-			if copyErr != nil {
-				return copyErr
-			}
-			if closeErr != nil {
-				return closeErr
-			}
-		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-				return err
-			}
-			_ = os.Remove(target)
-			if err := os.Symlink(header.Linkname, target); err != nil {
-				return err
-			}
-		case tar.TypeLink:
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-				return err
-			}
-			linkTarget := filepath.Join(targetDir, filepath.Clean(header.Linkname))
-			if err := os.Link(linkTarget, target); err != nil {
-				return err
-			}
-		default:
-			continue
-		}
-	}
-	return nil
 }
