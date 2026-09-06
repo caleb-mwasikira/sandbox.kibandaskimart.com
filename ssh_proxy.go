@@ -66,10 +66,28 @@ func startContainerShell(channel ssh.Channel, containerName string) {
 
 	statusCmd := exec.Command("lxc", "info", containerName)
 	output, err := statusCmd.CombinedOutput()
-	if err == nil && !strings.Contains(string(output), "Status: RUNNING") {
-		fmt.Printf("[*] Starting container %s...\n", containerName)
+
+	if err != nil {
+		fmt.Fprintf(channel, "[*] Container '%s' not found. Provisioning on first login...\n", containerName)
+
+		createCmd := exec.Command("lxc", "launch", "ubuntu:22.04", containerName)
+		createCmd.Stdout = channel
+		createCmd.Stderr = channel
+		if err := createCmd.Run(); err != nil {
+			fmt.Fprintf(channel, "[-] Failed to create container: %v\n", err)
+			return
+		}
+
+		_ = exec.Command("lxc", "config", "device", "add", containerName, "eth0", "nic", "nictype=bridged", "parent=lxdbr0").Run()
+		_ = exec.Command("lxc", "restart", containerName).Run()
+
+	} else if !strings.Contains(string(output), "Status: RUNNING") {
+		fmt.Fprintf(channel, "[*] Starting container %s...\n", containerName)
 		startCmd := exec.Command("lxc", "start", containerName)
-		_ = startCmd.Run()
+		if err := startCmd.Run(); err != nil {
+			fmt.Fprintf(channel, "[-] Failed to start container: %v\n", err)
+			return
+		}
 	}
 
 	cmd := exec.Command("lxc", "exec", "--env", "TERM=xterm-256color", containerName, "--", "su", "-", containerName)
