@@ -36,13 +36,13 @@ func handleClient(conn net.Conn, config *ssh.ServerConfig) {
 }
 
 func handleContainerSession(in <-chan *ssh.Request, channel ssh.Channel, username string) {
-	containerName := username
-
-	if containerName == "" || containerName == "root" || containerName == "lxdproxy" {
-		fmt.Fprintf(channel, "[-] Invalid target container name: %s\n", containerName)
+	if username == "" || username == "root" || username == "lxdproxy" {
+		fmt.Fprintf(channel, "[-] Invalid target user name: %s\n", username)
 		channel.Close()
 		return
 	}
+
+	containerName := username + "-sandbox"
 
 	for req := range in {
 		switch req.Type {

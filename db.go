@@ -73,15 +73,6 @@ func (s *SQLiteStore) DeleteUser(username string) error {
 	return err
 }
 
-func (s *SQLiteStore) ValidateUser(username, password string) bool {
-	var storedPassword string
-	err := db.QueryRow("SELECT password FROM users WHERE username = ?", username).Scan(&storedPassword)
-	if err != nil {
-		return false
-	}
-	return storedPassword == password
-}
-
 func (s *SQLiteStore) ListUsers() ([]User, error) {
 	rows, err := db.Query("SELECT username, email FROM users")
 	if err != nil {
@@ -98,4 +89,13 @@ func (s *SQLiteStore) ListUsers() ([]User, error) {
 		users = append(users, u)
 	}
 	return users, nil
+}
+
+func (s *SQLiteStore) ValidateUser(username, password string) bool {
+	var storedPassword string
+	err := db.QueryRow("SELECT password FROM users WHERE username = ?", username).Scan(&storedPassword)
+	if err != nil {
+		return false
+	}
+	return storedPassword == password
 }

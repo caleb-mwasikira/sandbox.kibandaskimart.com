@@ -25,10 +25,14 @@ func main() {
 	db = initDB()
 
 	addUserCmd := flag.NewFlagSet("add-user", flag.ExitOnError)
+	var imageFlag string
+	addUserCmd.StringVar(&imageFlag, "image", "ubuntu:22.04", "OS image for container")
+
 	updatePassCmd := flag.NewFlagSet("update-password", flag.ExitOnError)
 	updateEmailCmd := flag.NewFlagSet("update-email", flag.ExitOnError)
 	deleteUserCmd := flag.NewFlagSet("delete-user", flag.ExitOnError)
 	listUsersCmd := flag.NewFlagSet("list-users", flag.ExitOnError)
+	listImagesCmd := flag.NewFlagSet("list-images", flag.ExitOnError)
 
 	var (
 		host     string
@@ -50,7 +54,7 @@ func main() {
 		addUserCmd.Parse(os.Args[2:])
 		args := addUserCmd.Args()
 		if len(args) < 1 {
-			log.Fatal("[-] Usage: go run . add-user <username> [password]")
+			log.Fatal("[-] Usage: go run . add-user [--image <image>] <username> [password]")
 		}
 		username := args[0]
 		var password string
@@ -69,12 +73,12 @@ func main() {
 			log.Fatalf("[-] Failed to add user to database: %v", err)
 		}
 
-		fmt.Printf("[*] Provisioning container for user '%s'...\n", username)
-		if err := provisionUserContainer(username); err != nil {
+		fmt.Printf("[*] Provisioning container '%s-sandbox' with image '%s'...\n", username, imageFlag)
+		if err := provisionUserContainer(username, imageFlag); err != nil {
 			log.Fatalf("[-] Failed to create container for user: %v", err)
 		}
 
-		fmt.Printf("[+] User '%s' and container created successfully.\n", username)
+		fmt.Printf("[+] User '%s' and container '%s-sandbox' created successfully.\n", username, username)
 
 	case "update-password":
 		updatePassCmd.Parse(os.Args[2:])
@@ -151,10 +155,44 @@ func main() {
 			if emailDisplay == "" {
 				emailDisplay = "N/A"
 			}
-			fmt.Printf("Username: %s\n", u.Username)
-			fmt.Printf("Email:    %s\n", emailDisplay)
+			fmt.Printf("Username:  %s\n", u.Username)
+			fmt.Printf("Container: %s-sandbox\n", u.Username)
+			fmt.Printf("Email:     %s\n", emailDisplay)
 			fmt.Println("----------------------------------------")
 		}
+
+	case "list-images":
+		listImagesCmd.Parse(os.Args[2:])
+		args := listImagesCmd.Args()
+
+		lxcArgs := []string{"image", "list", "images:"}
+		if len(args) > 0 {
+			lxcArgs = append(lxcArgs, args[0])
+		}
+
+		lxcCmd := exec.Command("lxc", lxcArgs...)
+		pagerCmd := exec.Command("less", "-R")
+
+		pipe, err := lxcCmd.StdoutPipe()
+		if err != nil {
+			log.Fatalf("[-] Failed to create pipe: %v", err)
+		}
+		pagerCmd.Stdin = pipe
+		pagerCmd.Stdout = os.Stdout
+		pagerCmd.Stderr = os.Stderr
+
+		if err := pagerCmd.Start(); err != nil {
+			lxcCmd.Stdout = os.Stdout
+			lxcCmd.Stderr = os.Stderr
+			_ = lxcCmd.Run()
+			return
+		}
+
+		if err := lxcCmd.Run(); err != nil {
+			log.Fatalf("[-] Failed to list images: %v", err)
+		}
+
+		_ = pagerCmd.Wait()
 
 	case "start-server":
 		serverCmd.Parse(os.Args[2:])
@@ -166,22 +204,27 @@ func main() {
 	}
 }
 
-func provisionUserContainer(username string) error {
-	statusCmd := exec.Command("lxc", "info", username)
+func getContainerName(username string) string {
+	return username + "-sandbox"
+}
+
+func provisionUserContainer(username string, imageName string) error {
+	containerName := getContainerName(username)
+	statusCmd := exec.Command("lxc", "info", containerName)
 	if err := statusCmd.Run(); err == nil {
-		fmt.Printf("[*] Container '%s' already exists.\n", username)
+		fmt.Printf("[*] Container '%s' already exists.\n", containerName)
 		return nil
 	}
 
-	createCmd := exec.Command("lxc", "launch", "ubuntu:22.04", username)
+	createCmd := exec.Command("lxc", "launch", imageName, containerName)
 	createCmd.Stdout = os.Stdout
 	createCmd.Stderr = os.Stderr
 	if err := createCmd.Run(); err != nil {
 		return err
 	}
 
-	_ = exec.Command("lxc", "config", "device", "add", username, "eth0", "nic", "nictype=bridged", "parent=lxdbr0").Run()
-	_ = exec.Command("lxc", "restart", username).Run()
+	_ = exec.Command("lxc", "config", "device", "add", containerName, "eth0", "nic", "nictype=bridged", "parent=lxdbr0").Run()
+	_ = exec.Command("lxc", "restart", containerName).Run()
 
 	return nil
 }
@@ -198,11 +241,12 @@ func promptPassword(prompt string) string {
 
 func printUsage(errMsg string) {
 	fmt.Printf("%v. Usage:\n", errMsg)
-	fmt.Println("  go run . add-user <username> [password]")
+	fmt.Println("  go run . add-user [--image <image>] <username> [password]")
 	fmt.Println("  go run . update-password <username> [password]")
 	fmt.Println("  go run . update-email <username> [new-email]")
 	fmt.Println("  go run . delete-user <username>")
 	fmt.Println("  go run . list-users")
+	fmt.Println("  go run . list-images [search-term]")
 	fmt.Println("  go run . start-server [--host <host>] [--port <port>] [--http-port <http-port>]")
 }
 

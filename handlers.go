@@ -29,7 +29,7 @@ func AddUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"status": "success", "username": req.Username})
+	json.NewEncoder(w).Encode(map[string]string{"status": "success", "username": req.Username, "container": req.Username + "-sandbox"})
 }
 
 func UpdateUserHandler(w http.ResponseWriter, r *http.Request) {
