@@ -80,7 +80,6 @@ func startContainerShell(channel ssh.Channel, containerName string) {
 
 		_ = exec.Command("lxc", "config", "device", "add", containerName, "eth0", "nic", "nictype=bridged", "parent=lxdbr0").Run()
 		_ = exec.Command("lxc", "restart", containerName).Run()
-
 	} else if !strings.Contains(string(output), "Status: RUNNING") {
 		fmt.Fprintf(channel, "[*] Starting container %s...\n", containerName)
 		startCmd := exec.Command("lxc", "start", containerName)
@@ -90,7 +89,7 @@ func startContainerShell(channel ssh.Channel, containerName string) {
 		}
 	}
 
-	cmd := exec.Command("lxc", "exec", "--env", "TERM=xterm-256color", containerName, "--", "su", "-", containerName)
+	cmd := exec.Command("lxc", "exec", "-t", "--env", "TERM=xterm-256color", containerName, "--", "/bin/bash")
 
 	cmd.Stdin = channel
 	cmd.Stdout = channel

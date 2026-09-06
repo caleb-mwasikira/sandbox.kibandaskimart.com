@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 
@@ -65,9 +66,15 @@ func main() {
 
 		err := store.AddUser(User{Username: username, Password: password, Email: email})
 		if err != nil {
-			log.Fatalf("[-] Failed to add user: %v", err)
+			log.Fatalf("[-] Failed to add user to database: %v", err)
 		}
-		fmt.Printf("[+] User '%s' added successfully.\n", username)
+
+		fmt.Printf("[*] Provisioning container for user '%s'...\n", username)
+		if err := provisionUserContainer(username); err != nil {
+			log.Fatalf("[-] Failed to create container for user: %v", err)
+		}
+
+		fmt.Printf("[+] User '%s' and container created successfully.\n", username)
 
 	case "update-password":
 		updatePassCmd.Parse(os.Args[2:])
@@ -157,6 +164,26 @@ func main() {
 		printUsage("Unknown command")
 		os.Exit(1)
 	}
+}
+
+func provisionUserContainer(username string) error {
+	statusCmd := exec.Command("lxc", "info", username)
+	if err := statusCmd.Run(); err == nil {
+		fmt.Printf("[*] Container '%s' already exists.\n", username)
+		return nil
+	}
+
+	createCmd := exec.Command("lxc", "launch", "ubuntu:22.04", username)
+	createCmd.Stdout = os.Stdout
+	createCmd.Stderr = os.Stderr
+	if err := createCmd.Run(); err != nil {
+		return err
+	}
+
+	_ = exec.Command("lxc", "config", "device", "add", username, "eth0", "nic", "nictype=bridged", "parent=lxdbr0").Run()
+	_ = exec.Command("lxc", "restart", username).Run()
+
+	return nil
 }
 
 func promptPassword(prompt string) string {
