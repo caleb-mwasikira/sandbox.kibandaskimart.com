@@ -31,4 +31,6 @@ go.work.sum
 # .idea/
 # .vscode/
 
-os_images/
+os-images/
+*.db
+build/
