@@ -81,3 +81,21 @@ func (s *SQLiteStore) ValidateUser(username, password string) bool {
 	}
 	return storedPassword == password
 }
+
+func (s *SQLiteStore) ListUsers() ([]User, error) {
+	rows, err := db.Query("SELECT username, email FROM users")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []User
+	for rows.Next() {
+		var u User
+		if err := rows.Scan(&u.Username, &u.Email); err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	return users, nil
+}

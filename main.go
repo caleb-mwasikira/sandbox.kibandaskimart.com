@@ -27,6 +27,7 @@ func main() {
 	updatePassCmd := flag.NewFlagSet("update-password", flag.ExitOnError)
 	updateEmailCmd := flag.NewFlagSet("update-email", flag.ExitOnError)
 	deleteUserCmd := flag.NewFlagSet("delete-user", flag.ExitOnError)
+	listUsersCmd := flag.NewFlagSet("list-users", flag.ExitOnError)
 
 	var (
 		host     string
@@ -123,6 +124,31 @@ func main() {
 		}
 		fmt.Printf("[+] User '%s' deleted successfully.\n", username)
 
+	case "list-users":
+		listUsersCmd.Parse(os.Args[2:])
+		users, err := store.ListUsers()
+		if err != nil {
+			log.Fatalf("[-] Failed to list users: %v", err)
+		}
+
+		if len(users) == 0 {
+			fmt.Println("[-] No container users found.")
+			return
+		}
+
+		fmt.Println("\n----------------------------------------")
+		fmt.Println("Registered Container Users:")
+		fmt.Println("----------------------------------------")
+		for _, u := range users {
+			emailDisplay := u.Email
+			if emailDisplay == "" {
+				emailDisplay = "N/A"
+			}
+			fmt.Printf("Username: %s\n", u.Username)
+			fmt.Printf("Email:    %s\n", emailDisplay)
+			fmt.Println("----------------------------------------")
+		}
+
 	case "start-server":
 		serverCmd.Parse(os.Args[2:])
 		runServers(host, sshPort, httpPort)
@@ -149,6 +175,7 @@ func printUsage(errMsg string) {
 	fmt.Println("  go run . update-password <username> [password]")
 	fmt.Println("  go run . update-email <username> [new-email]")
 	fmt.Println("  go run . delete-user <username>")
+	fmt.Println("  go run . list-users")
 	fmt.Println("  go run . start-server [--host <host>] [--port <port>] [--http-port <http-port>]")
 }
 
