@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/go-chi/chi/v5"
@@ -25,11 +26,30 @@ func main() {
 	db = initDB()
 
 	addUserCmd := flag.NewFlagSet("add-user", flag.ExitOnError)
-	var imageFlag string
+	var (
+		imageFlag   string
+		memoryFlag  string
+		storageFlag string
+		cpusFlag    string
+	)
 	addUserCmd.StringVar(&imageFlag, "image", "ubuntu:22.04", "OS image for container")
+	addUserCmd.StringVar(&memoryFlag, "memory", "", "Memory limit (e.g., 512MB, 2GB)")
+	addUserCmd.StringVar(&storageFlag, "storage", "", "Storage size limit (e.g., 10GB, 50GB)")
+	addUserCmd.StringVar(&cpusFlag, "cpus", "", "CPU limit (e.g., 2, 0.5)")
 
 	updatePassCmd := flag.NewFlagSet("update-password", flag.ExitOnError)
 	updateEmailCmd := flag.NewFlagSet("update-email", flag.ExitOnError)
+
+	updateLimitsCmd := flag.NewFlagSet("update-limits", flag.ExitOnError)
+	var (
+		updateMemoryFlag  string
+		updateStorageFlag string
+		updateCpusFlag    string
+	)
+	updateLimitsCmd.StringVar(&updateMemoryFlag, "memory", "", "Memory limit (e.g., 512MB, 2GB)")
+	updateLimitsCmd.StringVar(&updateStorageFlag, "storage", "", "Storage size limit (e.g., 10GB, 50GB)")
+	updateLimitsCmd.StringVar(&updateCpusFlag, "cpus", "", "CPU limit (e.g., 2, 0.5)")
+
 	deleteUserCmd := flag.NewFlagSet("delete-user", flag.ExitOnError)
 	listUsersCmd := flag.NewFlagSet("list-users", flag.ExitOnError)
 	listImagesCmd := flag.NewFlagSet("list-images", flag.ExitOnError)
@@ -54,7 +74,7 @@ func main() {
 		addUserCmd.Parse(os.Args[2:])
 		args := addUserCmd.Args()
 		if len(args) < 1 {
-			log.Fatal("[-] Usage: go run . add-user [--image <image>] <username> [password]")
+			log.Fatal("[-] Usage: go run . add-user [flags] <username> [password]")
 		}
 		username := args[0]
 		var password string
@@ -74,7 +94,7 @@ func main() {
 		}
 
 		fmt.Printf("[*] Provisioning container '%s-sandbox' with image '%s'...\n", username, imageFlag)
-		if err := provisionUserContainer(username, imageFlag); err != nil {
+		if err := provisionUserContainer(username, imageFlag, memoryFlag, storageFlag, cpusFlag); err != nil {
 			log.Fatalf("[-] Failed to create container for user: %v", err)
 		}
 
@@ -120,6 +140,59 @@ func main() {
 			log.Fatalf("[-] Failed to update email: %v", err)
 		}
 		fmt.Printf("[+] Email updated successfully for '%s'.\n", username)
+
+	case "update-limits":
+		updateLimitsCmd.Parse(os.Args[2:])
+		args := updateLimitsCmd.Args()
+		if len(args) < 1 {
+			log.Fatal("[-] Usage: go run . update-limits [flags] <username>")
+		}
+		username := args[0]
+		containerName := getContainerName(username)
+
+		statusCmd := exec.Command("lxc", "info", containerName)
+		if err := statusCmd.Run(); err != nil {
+			log.Fatalf("[-] Container '%s' does not exist.", containerName)
+		}
+
+		updated := false
+		if updateMemoryFlag != "" {
+			cmd := exec.Command("lxc", "config", "set", containerName, "limits.memory", updateMemoryFlag)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				log.Printf("[-] Failed to update memory limit: %s", strings.TrimSpace(string(output)))
+			} else {
+				fmt.Printf("[+] Memory limit updated to %s\n", updateMemoryFlag)
+				updated = true
+			}
+		}
+		if updateStorageFlag != "" {
+			cmd := exec.Command("lxc", "config", "device", "set", containerName, "root", "size", updateStorageFlag)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				cmdAdd := exec.Command("lxc", "config", "device", "add", containerName, "root", "disk", "pool=default", fmt.Sprintf("size=%s", updateStorageFlag))
+				output, err = cmdAdd.CombinedOutput()
+			}
+
+			if err != nil {
+				log.Printf("[-] Failed to update storage limit: %s", strings.TrimSpace(string(output)))
+			} else {
+				fmt.Printf("[+] Storage limit updated to %s\n", updateStorageFlag)
+				updated = true
+			}
+		}
+		if updateCpusFlag != "" {
+			cmd := exec.Command("lxc", "config", "set", containerName, "limits.cpu", updateCpusFlag)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				log.Printf("[-] Failed to update CPU limit: %s", strings.TrimSpace(string(output)))
+			} else {
+				fmt.Printf("[+] CPU limit updated to %s\n", updateCpusFlag)
+				updated = true
+			}
+		}
+
+		if !updated {
+			fmt.Println("[-] No limits specified to update. Use --memory, --storage, or --cpus.")
+		}
 
 	case "delete-user":
 		deleteUserCmd.Parse(os.Args[2:])
@@ -208,7 +281,7 @@ func getContainerName(username string) string {
 	return username + "-sandbox"
 }
 
-func provisionUserContainer(username string, imageName string) error {
+func provisionUserContainer(username, imageName, memory, storage, cpus string) error {
 	containerName := getContainerName(username)
 	statusCmd := exec.Command("lxc", "info", containerName)
 	if err := statusCmd.Run(); err == nil {
@@ -224,6 +297,26 @@ func provisionUserContainer(username string, imageName string) error {
 	}
 
 	_ = exec.Command("lxc", "config", "device", "add", containerName, "eth0", "nic", "nictype=bridged", "parent=lxdbr0").Run()
+
+	if memory != "" {
+		cmd := exec.Command("lxc", "config", "set", containerName, "limits.memory", memory)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			fmt.Printf("[-] Warning: Failed to set memory limit: %s\n", strings.TrimSpace(string(output)))
+		}
+	}
+	if storage != "" {
+		cmd := exec.Command("lxc", "config", "device", "add", containerName, "root", "disk", "pool=default", fmt.Sprintf("size=%s", storage))
+		if output, err := cmd.CombinedOutput(); err != nil {
+			fmt.Printf("[-] Warning: Failed to set storage limit: %s\n", strings.TrimSpace(string(output)))
+		}
+	}
+	if cpus != "" {
+		cmd := exec.Command("lxc", "config", "set", containerName, "limits.cpu", cpus)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			fmt.Printf("[-] Warning: Failed to set CPU limit: %s\n", strings.TrimSpace(string(output)))
+		}
+	}
+
 	_ = exec.Command("lxc", "restart", containerName).Run()
 
 	return nil
@@ -241,9 +334,10 @@ func promptPassword(prompt string) string {
 
 func printUsage(errMsg string) {
 	fmt.Printf("%v. Usage:\n", errMsg)
-	fmt.Println("  go run . add-user [--image <image>] <username> [password]")
+	fmt.Println("  go run . add-user [--image <image>] [--memory <limit>] [--storage <size>] [--cpus <limit>] <username> [password]")
 	fmt.Println("  go run . update-password <username> [password]")
 	fmt.Println("  go run . update-email <username> [new-email]")
+	fmt.Println("  go run . update-limits [--memory <limit>] [--storage <size>] [--cpus <limit>] <username>")
 	fmt.Println("  go run . delete-user <username>")
 	fmt.Println("  go run . list-users")
 	fmt.Println("  go run . list-images [search-term]")
