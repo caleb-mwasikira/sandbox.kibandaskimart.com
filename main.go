@@ -340,15 +340,71 @@ func promptPassword(prompt string) string {
 }
 
 func printUsage(errMsg string) {
-	fmt.Printf("%v. Usage:\n", errMsg)
-	fmt.Println("  go run . add-user [--image <image>] [--memory <limit>] [--storage <size>] [--cpus <limit>] <username> [password]")
-	fmt.Println("  go run . update-password <username> [password]")
-	fmt.Println("  go run . update-email <username> [new-email]")
-	fmt.Println("  go run . update-limits [--memory <limit>] [--storage <size>] [--cpus <limit>] <username>")
-	fmt.Println("  go run . delete-user <username>")
-	fmt.Println("  go run . list-users")
-	fmt.Println("  go run . list-images [search-term]")
-	fmt.Println("  go run . start-server [--host <host>] [--port <port>] [--http-port <http-port>]")
+	if errMsg != "" {
+		fmt.Printf("\n[-] Error: %s\n", errMsg)
+	}
+
+	fmt.Println(`
+NAME
+  lxd-sandbox - LXD Container Sandbox Manager and Smart SSH Gateway
+
+SYNOPSIS
+  go run . <command> [arguments] [options]
+
+DESCRIPTION
+  Automates container provisioning, enforces resource limits, and acts as a
+  smart SSH proxy gateway routing standard traffic directly into isolated LXD sandboxes.
+
+COMMANDS
+  add-user [options] <username> [password]
+    Create a new database user and provision an isolated container sandbox.
+    Options:
+      --image <image>     OS container image (default "ubuntu:22.04")
+      --memory <limit>    Memory limit (e.g., 512MB, 2GB)
+      --storage <size>    Storage size limit (e.g., 10GB, 50GB)
+      --cpus <limit>      CPU limit (e.g., 2, 0.5)
+
+  update-password <username> [password]
+    Change the authentication password for an existing user.
+
+  update-email <username> [new-email]
+    Update the contact email address associated with a user.
+
+  update-limits [options] <username>
+    Modify live resource allocations for an existing user container.
+    Options:
+      --memory <limit>    Update memory limit
+      --storage <size>    Update storage limit
+      --cpus <limit>      Update CPU limit
+
+  delete-user <username>
+    Remove a user from the database and delete their sandbox container.
+
+  list-users
+    Display all registered container users, emails, and container statuses.
+
+  list-images [search-term]
+    Search architecture-compatible container images available from remote.
+
+  start-server [options]
+    Launch the smart SSH gateway server and HTTP user management API.
+    Options:
+      --host <host>       Host to bind SSH server (default "0.0.0.0")
+      --port <port>       Port to run SSH gateway (default 2022)
+      --http-port <port>  Port to run HTTP server (default 8080)
+
+EXAMPLES
+  # Provision a user with custom container memory and image
+  go run . add-user --image ubuntu:22.04 --memory 1GB alice
+
+  # Update live resource restrictions
+  go run . update-limits --memory 2GB --cpus 2 alice
+
+  # Search remote compatible images
+  go run . list-images ubuntu
+
+  # Start the gateway server on standard port 2022
+  go run . start-server --port 2022 --http-port 8080`)
 }
 
 func runServers(host string, port uint, httpPort uint) {
