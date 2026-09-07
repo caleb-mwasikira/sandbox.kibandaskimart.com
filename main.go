@@ -201,12 +201,19 @@ func main() {
 			log.Fatal("[-] Usage: go run . delete-user <username>")
 		}
 		username := args[0]
+		containerName := getContainerName(username)
+
+		// Stop and delete container instance
+		_ = exec.Command("lxc", "stop", containerName, "--force").Run()
+		if err := exec.Command("lxc", "delete", containerName).Run(); err != nil {
+			log.Printf("[-] Warning: Failed to delete container '%s': %v", containerName, err)
+		}
 
 		err := store.DeleteUser(username)
 		if err != nil {
-			log.Fatalf("[-] Failed to delete user: %v", err)
+			log.Fatalf("[-] Failed to delete user from DB: %v", err)
 		}
-		fmt.Printf("[+] User '%s' deleted successfully.\n", username)
+		fmt.Printf("[+] User '%s' and container '%s' deleted successfully.\n", username, containerName)
 
 	case "list-users":
 		listUsersCmd.Parse(os.Args[2:])

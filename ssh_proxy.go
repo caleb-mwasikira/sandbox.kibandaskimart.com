@@ -89,7 +89,7 @@ func startContainerShell(channel ssh.Channel, containerName string) {
 		}
 	}
 
-	cmd := exec.Command("lxc", "exec", "-t", "--env", "TERM=xterm-256color", containerName, "--", "/bin/bash")
+	cmd := exec.Command("lxc", "exec", containerName, "--env", "TERM=xterm-256color", "--", "/bin/bash", "-l")
 
 	cmd.Stdin = channel
 	cmd.Stdout = channel
